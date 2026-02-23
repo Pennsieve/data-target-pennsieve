@@ -79,6 +79,9 @@ func loadConfig() (*Config, error) {
 	if cfg.DatasetID == "" {
 		return nil, fmt.Errorf("DATASET_ID is required")
 	}
+	if cfg.RefreshToken == "" {
+		return nil, fmt.Errorf("REFRESH_TOKEN is required")
+	}
 	if cfg.UploadBucket == "" {
 		cfg.UploadBucket = "pennsieve-prod-uploads-v2-use1"
 	}

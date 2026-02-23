@@ -66,8 +66,8 @@ func refreshForIDToken(ctx context.Context, cfg aws.Config, cognitoConfig *Cogni
 func getCredentialsForIdentity(ctx context.Context, cfg aws.Config, cognitoConfig *CognitoConfig, idToken string) (aws.Credentials, error) {
 	svc := cognitoidentity.NewFromConfig(cfg)
 
-	// The logins key uses the TokenPool ID (not UserPool)
-	poolResource := fmt.Sprintf("cognito-idp.us-east-1.amazonaws.com/%s", cognitoConfig.TokenPool.ID)
+	// The logins key must match the issuer of the IdToken, which is the UserPool
+	poolResource := fmt.Sprintf("cognito-idp.%s.amazonaws.com/%s", cognitoConfig.UserPool.Region, cognitoConfig.UserPool.ID)
 	logins := map[string]string{
 		poolResource: idToken,
 	}
