@@ -34,7 +34,13 @@ type Config struct {
 // Step Functions Lambda invoke state. Static env vars (PENNSIEVE_API_HOST,
 // PENNSIEVE_API_HOST2, DEPLOYMENT_MODE, REGION, ENVIRONMENT) are already
 // set on the Lambda function configuration at creation time.
+//
+// Common fields (inputDir, sessionToken, etc.) are shared by all processors/targets.
+// Target-type-specific params are passed as a flat map with SCREAMING_SNAKE_CASE keys
+// matching env var names (e.g. UPLOAD_BUCKET, TARGET_FOLDER). The handler bridges
+// all fields to env vars so the core logic works identically to ECS mode.
 type LambdaEvent struct {
+	// Common fields
 	InputDir       string `json:"inputDir"`
 	ExecutionRunID string `json:"executionRunId"`
 	IntegrationID  string `json:"integrationId"`
@@ -43,9 +49,10 @@ type LambdaEvent struct {
 	RefreshToken   string `json:"refreshToken"`
 	DatasetID      string `json:"datasetId"`
 	OrganizationID string `json:"organizationId"`
-	TargetFolder   string `json:"targetFolder"`
 	TargetType     string `json:"targetType"`
-	UploadBucket   string `json:"uploadBucket"`
+
+	// Target-type-specific params (SCREAMING_SNAKE_CASE keys → env vars)
+	Params map[string]string `json:"params"`
 }
 
 // LambdaResponse is returned to Step Functions after the handler completes.
@@ -228,10 +235,11 @@ func lambdaHandler(ctx context.Context, event LambdaEvent) (LambdaResponse, erro
 	os.Setenv("EXECUTION_RUN_ID", event.ExecutionRunID)
 	os.Setenv("DATASET_ID", event.DatasetID)
 	os.Setenv("ORGANIZATION_ID", event.OrganizationID)
-	os.Setenv("TARGET_FOLDER", event.TargetFolder)
 	os.Setenv("TARGET_TYPE", event.TargetType)
-	if event.UploadBucket != "" {
-		os.Setenv("UPLOAD_BUCKET", event.UploadBucket)
+
+	// Bridge target-type-specific params to env vars
+	for k, v := range event.Params {
+		os.Setenv(k, v)
 	}
 
 	if err := run(); err != nil {
