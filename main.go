@@ -96,19 +96,35 @@ func loadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// discoverFiles walks INPUT_DIR and returns all file paths.
+// discoverFiles walks INPUT_DIR and returns all regular file paths.
+// It follows symlinks so that processor output written as symlinked
+// directories is included.
 func discoverFiles(inputDir string) ([]string, error) {
 	var files []string
-	err := filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			files = append(files, path)
+		for _, e := range entries {
+			path := filepath.Join(dir, e.Name())
+			// Resolve symlinks by using os.Stat (follows symlinks)
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				if err := walk(path); err != nil {
+					return err
+				}
+			} else if info.Mode().IsRegular() {
+				files = append(files, path)
+			}
 		}
 		return nil
-	})
-	return files, err
+	}
+	return files, walk(inputDir)
 }
 
 // run contains the core target logic shared between ECS and Lambda modes.
