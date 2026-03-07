@@ -6,46 +6,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 // PennsieveClient is a minimal HTTP client for the Pennsieve API endpoints
-// needed by the upload target: cognito-config and manifest management.
+// needed by the upload target: manifest management.
 type PennsieveClient struct {
-	apiHost    string // e.g. https://api.pennsieve.io
-	apiHost2   string // e.g. https://api2.pennsieve.io
-	token      string // SESSION_TOKEN used as Bearer token
-	httpClient *http.Client
+	apiHost2       string // e.g. https://api2.pennsieve.io
+	executionRunID string
+	callbackToken  string
+	httpClient     *http.Client
 }
 
-func NewPennsieveClient(apiHost, apiHost2, token string) *PennsieveClient {
+func NewPennsieveClient(apiHost2, executionRunID, callbackToken string) *PennsieveClient {
 	return &PennsieveClient{
-		apiHost:  apiHost,
-		apiHost2: apiHost2,
-		token:    token,
+		apiHost2:       apiHost2,
+		executionRunID: executionRunID,
+		callbackToken:  callbackToken,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}
-}
-
-// CognitoConfig is the response from GET /authentication/cognito-config.
-type CognitoConfig struct {
-	Region       string       `json:"region"`
-	UserPool     CognitoPool  `json:"userPool"`
-	TokenPool    CognitoPool  `json:"tokenPool"`
-	IdentityPool IdentityPool `json:"identityPool"`
-}
-
-type CognitoPool struct {
-	Region      string `json:"region"`
-	ID          string `json:"id"`
-	AppClientID string `json:"appClientId"`
-}
-
-type IdentityPool struct {
-	Region string `json:"region"`
-	ID     string `json:"id"`
 }
 
 // ManifestFileDTO represents a file to register in a manifest.
@@ -56,34 +38,18 @@ type ManifestFileDTO struct {
 	TargetName string `json:"target_name"`
 }
 
-// ManifestRequest is the body for POST /upload/manifest.
+// ManifestRequest is the body for POST /manifest.
 type ManifestRequest struct {
 	ID        string            `json:"id"`
 	DatasetID string            `json:"dataset_id"`
 	Files     []ManifestFileDTO `json:"files"`
 }
 
-// ManifestResponse is the response from POST /upload/manifest.
+// ManifestResponse is the response from POST /manifest.
 type ManifestResponse struct {
 	ManifestNodeID string   `json:"manifest_node_id"`
 	NrFilesUpdated int      `json:"nr_files_updated"`
 	FailedFiles    []string `json:"failed_files"`
-}
-
-// GetCognitoConfig fetches the Cognito pool configuration from the Pennsieve API.
-// This endpoint is unauthenticated.
-func (c *PennsieveClient) GetCognitoConfig() (*CognitoConfig, error) {
-	url := fmt.Sprintf("%s/authentication/cognito-config", c.apiHost)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating cognito-config request: %w", err)
-	}
-
-	var result CognitoConfig
-	if err := c.doJSON(req, false, &result); err != nil {
-		return nil, fmt.Errorf("fetching cognito-config: %w", err)
-	}
-	return &result, nil
 }
 
 // CreateManifest creates a new upload manifest for the given dataset.
@@ -117,26 +83,23 @@ func (c *PennsieveClient) SyncManifest(manifestNodeID, datasetID string, files [
 }
 
 func (c *PennsieveClient) postManifest(datasetID string, body interface{}, result interface{}) error {
-	url := fmt.Sprintf("%s/upload/manifest?dataset_id=%s", c.apiHost2, datasetID)
+	reqURL := fmt.Sprintf("%s/manifest?dataset_id=%s", c.apiHost2, url.QueryEscape(datasetID))
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshaling manifest request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	req, err := http.NewRequest("POST", reqURL, bytes.NewReader(jsonBody))
 	if err != nil {
 		return fmt.Errorf("creating manifest request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Callback workflow-service:%s:%s", c.executionRunID, c.callbackToken))
 
-	return c.doJSON(req, true, result)
+	return c.doJSON(req, result)
 }
 
-func (c *PennsieveClient) doJSON(req *http.Request, auth bool, result interface{}) error {
-	if auth {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
+func (c *PennsieveClient) doJSON(req *http.Request, result interface{}) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %w", err)

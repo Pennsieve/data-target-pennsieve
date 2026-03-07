@@ -25,9 +25,12 @@ type FileToUpload struct {
 // UploadFiles uploads all files to S3 using the temporary AWS credentials
 // obtained from Cognito. Files are uploaded sequentially with multipart
 // support for large files.
-func UploadFiles(ctx context.Context, creds aws.Credentials, bucket, manifestNodeID string, files []FileToUpload, orgID, datasetID string) error {
+func UploadFiles(ctx context.Context, creds aws.Credentials, bucket, manifestNodeID string, files []FileToUpload, orgID, datasetID, region string) error {
+	if region == "" {
+		region = "us-east-1"
+	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithRegion(region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			creds.AccessKeyID,
 			creds.SecretAccessKey,

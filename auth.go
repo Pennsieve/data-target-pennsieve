@@ -1,104 +1,64 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/cognitoidentity"
-	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
-	cidptypes "github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider/types"
 )
 
-// RefreshAndGetAWSCredentials exchanges a Cognito refresh token for temporary
-// AWS credentials that can be used to upload to S3.
-//
-// Flow:
-//  1. REFRESH_TOKEN_AUTH via Cognito UserPool → IdToken
-//  2. GetId + GetCredentialsForIdentity via Cognito Identity Pool → AWS creds
-func RefreshAndGetAWSCredentials(ctx context.Context, cognitoConfig *CognitoConfig, refreshToken string) (aws.Credentials, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cognitoConfig.Region))
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("loading AWS config: %w", err)
-	}
-
-	// Step 1: Refresh token → IdToken using UserPool.AppClientID
-	idToken, err := refreshForIDToken(ctx, cfg, cognitoConfig, refreshToken)
-	if err != nil {
-		return aws.Credentials{}, err
-	}
-
-	// Step 2: IdToken → temporary AWS credentials using Identity Pool
-	creds, err := getCredentialsForIdentity(ctx, cfg, cognitoConfig, idToken)
-	if err != nil {
-		return aws.Credentials{}, err
-	}
-
-	return creds, nil
+// UploadCredentialsResponse matches the response from POST /manifest/upload-credentials.
+type UploadCredentialsResponse struct {
+	AccessKeyID    string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
+	SessionToken   string `json:"sessionToken"`
+	Expiration     string `json:"expiration"`
+	Bucket         string `json:"bucket"`
+	Region         string `json:"region"`
 }
 
-// refreshForIDToken uses the Cognito REFRESH_TOKEN_AUTH flow with the
-// UserPool's AppClientID to get a fresh IdToken.
-func refreshForIDToken(ctx context.Context, cfg aws.Config, cognitoConfig *CognitoConfig, refreshToken string) (string, error) {
-	svc := cognitoidentityprovider.NewFromConfig(cfg)
+// GetUploadCredentials calls the upload service to get temporary S3 credentials
+// scoped to the given manifest prefix.
+func GetUploadCredentials(apiHost2, datasetID, manifestNodeID, executionRunID, callbackToken string) (aws.Credentials, string, string, error) {
+	reqURL := fmt.Sprintf("%s/manifest/upload-credentials?dataset_id=%s", apiHost2, url.QueryEscape(datasetID))
 
-	resp, err := svc.InitiateAuth(ctx, &cognitoidentityprovider.InitiateAuthInput{
-		AuthFlow: cidptypes.AuthFlowTypeRefreshToken,
-		ClientId: aws.String(cognitoConfig.UserPool.AppClientID),
-		AuthParameters: map[string]string{
-			"REFRESH_TOKEN": refreshToken,
-		},
-	})
+	body := fmt.Sprintf(`{"manifestNodeId":%q}`, manifestNodeID)
+	req, err := http.NewRequest("POST", reqURL, strings.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("REFRESH_TOKEN_AUTH failed: %w", err)
+		return aws.Credentials{}, "", "", fmt.Errorf("creating request: %w", err)
 	}
+	req.Header.Set("Authorization", fmt.Sprintf("Callback workflow-service:%s:%s", executionRunID, callbackToken))
+	req.Header.Set("Content-Type", "application/json")
 
-	if resp.AuthenticationResult == nil || resp.AuthenticationResult.IdToken == nil {
-		return "", fmt.Errorf("REFRESH_TOKEN_AUTH returned no IdToken")
-	}
-
-	return *resp.AuthenticationResult.IdToken, nil
-}
-
-// getCredentialsForIdentity exchanges an IdToken for temporary AWS credentials
-// via the Cognito Identity Pool. Uses TokenPool.ID as the login provider key.
-func getCredentialsForIdentity(ctx context.Context, cfg aws.Config, cognitoConfig *CognitoConfig, idToken string) (aws.Credentials, error) {
-	svc := cognitoidentity.NewFromConfig(cfg)
-
-	// The logins key must match the issuer of the IdToken, which is the UserPool
-	poolResource := fmt.Sprintf("cognito-idp.%s.amazonaws.com/%s", cognitoConfig.UserPool.Region, cognitoConfig.UserPool.ID)
-	logins := map[string]string{
-		poolResource: idToken,
-	}
-
-	// GetId: exchange IdToken for an identity ID
-	idResp, err := svc.GetId(ctx, &cognitoidentity.GetIdInput{
-		IdentityPoolId: aws.String(cognitoConfig.IdentityPool.ID),
-		Logins:         logins,
-	})
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("Cognito GetId failed: %w", err)
+		return aws.Credentials{}, "", "", fmt.Errorf("upload-credentials request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return aws.Credentials{}, "", "", fmt.Errorf("upload-credentials returned status %d", resp.StatusCode)
 	}
 
-	// GetCredentialsForIdentity: exchange identity ID for temporary AWS creds
-	credResp, err := svc.GetCredentialsForIdentity(ctx, &cognitoidentity.GetCredentialsForIdentityInput{
-		IdentityId: idResp.IdentityId,
-		Logins:     logins,
-	})
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("Cognito GetCredentialsForIdentity failed: %w", err)
+	var result UploadCredentialsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return aws.Credentials{}, "", "", fmt.Errorf("decoding response: %w", err)
 	}
 
-	if credResp.Credentials == nil {
-		return aws.Credentials{}, fmt.Errorf("GetCredentialsForIdentity returned no credentials")
+	expiration, _ := time.Parse(time.RFC3339, result.Expiration)
+
+	creds := aws.Credentials{
+		AccessKeyID:    result.AccessKeyID,
+		SecretAccessKey: result.SecretAccessKey,
+		SessionToken:   result.SessionToken,
+		CanExpire:      true,
+		Expires:        expiration,
 	}
 
-	return aws.Credentials{
-		AccessKeyID:     *credResp.Credentials.AccessKeyId,
-		SecretAccessKey:  *credResp.Credentials.SecretKey,
-		SessionToken:    *credResp.Credentials.SessionToken,
-		CanExpire:       true,
-		Expires:         *credResp.Credentials.Expiration,
-	}, nil
+	return creds, result.Bucket, result.Region, nil
 }

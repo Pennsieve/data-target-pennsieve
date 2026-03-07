@@ -15,12 +15,10 @@ import (
 type Config struct {
 	// Standard env vars (same as processors)
 	InputDir       string
-	SessionToken   string
-	RefreshToken   string
-	APIHost        string
 	APIHost2       string
 	DeploymentMode string
 	ExecutionRunID string
+	CallbackToken  string
 
 	// Target-specific env vars
 	DatasetID      string
@@ -31,22 +29,14 @@ type Config struct {
 }
 
 // LambdaEvent mirrors the per-invocation payload fields sent by the
-// Step Functions Lambda invoke state. Static env vars (PENNSIEVE_API_HOST,
-// PENNSIEVE_API_HOST2, DEPLOYMENT_MODE, REGION, ENVIRONMENT) are already
-// set on the Lambda function configuration at creation time.
-//
-// Common fields (inputDir, sessionToken, etc.) are shared by all processors/targets.
-// Target-type-specific params are passed as a flat map with SCREAMING_SNAKE_CASE keys
-// matching env var names (e.g. UPLOAD_BUCKET, TARGET_FOLDER). The handler bridges
-// all fields to env vars so the core logic works identically to ECS mode.
+// Step Functions Lambda invoke state.
 type LambdaEvent struct {
 	// Common fields
 	InputDir       string `json:"inputDir"`
 	ExecutionRunID string `json:"executionRunId"`
 	IntegrationID  string `json:"integrationId"`
 	ComputeNodeID  string `json:"computeNodeId"`
-	SessionToken   string `json:"sessionToken"`
-	RefreshToken   string `json:"refreshToken"`
+	CallbackToken  string `json:"callbackToken"`
 	DatasetID      string `json:"datasetId"`
 	OrganizationID string `json:"organizationId"`
 	TargetType     string `json:"targetType"`
@@ -64,12 +54,10 @@ type LambdaResponse struct {
 func loadConfig() (*Config, error) {
 	cfg := &Config{
 		InputDir:       os.Getenv("INPUT_DIR"),
-		SessionToken:   os.Getenv("SESSION_TOKEN"),
-		RefreshToken:   os.Getenv("REFRESH_TOKEN"),
-		APIHost:        os.Getenv("PENNSIEVE_API_HOST"),
 		APIHost2:       os.Getenv("PENNSIEVE_API_HOST2"),
 		DeploymentMode: os.Getenv("DEPLOYMENT_MODE"),
 		ExecutionRunID: os.Getenv("EXECUTION_RUN_ID"),
+		CallbackToken:  os.Getenv("CALLBACK_TOKEN"),
 		DatasetID:      os.Getenv("DATASET_ID"),
 		OrganizationID: os.Getenv("ORGANIZATION_ID"),
 		TargetFolder:   os.Getenv("TARGET_FOLDER"),
@@ -80,17 +68,14 @@ func loadConfig() (*Config, error) {
 	if cfg.InputDir == "" {
 		return nil, fmt.Errorf("INPUT_DIR is required")
 	}
-	if cfg.SessionToken == "" {
-		return nil, fmt.Errorf("SESSION_TOKEN is required")
+	if cfg.CallbackToken == "" {
+		return nil, fmt.Errorf("CALLBACK_TOKEN is required")
 	}
 	if cfg.DatasetID == "" {
 		return nil, fmt.Errorf("DATASET_ID is required")
 	}
-	if cfg.RefreshToken == "" {
-		return nil, fmt.Errorf("REFRESH_TOKEN is required")
-	}
-	if cfg.UploadBucket == "" {
-		cfg.UploadBucket = "pennsieve-prod-uploads-v2-use1"
+	if cfg.ExecutionRunID == "" {
+		return nil, fmt.Errorf("EXECUTION_RUN_ID is required")
 	}
 
 	return cfg, nil
@@ -134,8 +119,6 @@ func run() error {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	ctx := context.Background()
-
 	log.Printf("Starting pennsieve-upload target")
 	log.Printf("  executionRunId: %s", cfg.ExecutionRunID)
 	log.Printf("  inputDir:       %s", cfg.InputDir)
@@ -143,8 +126,7 @@ func run() error {
 	log.Printf("  organizationId: %s", cfg.OrganizationID)
 	log.Printf("  targetFolder:   %s", cfg.TargetFolder)
 	log.Printf("  deploymentMode: %s", cfg.DeploymentMode)
-	log.Printf("  apiHost:        %s", cfg.APIHost)
-	log.Printf("  uploadBucket:   %s", cfg.UploadBucket)
+	log.Printf("  apiHost2:       %s", cfg.APIHost2)
 
 	// Discover files from EFS input directory
 	files, err := discoverFiles(cfg.InputDir)
@@ -168,18 +150,10 @@ func run() error {
 		log.Printf("  %s (%d bytes)", rel, size)
 	}
 
-	// Step 1: Create Pennsieve client
-	client := NewPennsieveClient(cfg.APIHost, cfg.APIHost2, cfg.SessionToken)
+	// Step 1: Create Pennsieve client (uses callback auth)
+	client := NewPennsieveClient(cfg.APIHost2, cfg.ExecutionRunID, cfg.CallbackToken)
 
-	// Step 2: Get Cognito config
-	log.Printf("Fetching Cognito configuration...")
-	cognitoConfig, err := client.GetCognitoConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get cognito config: %w", err)
-	}
-	log.Printf("Cognito config: region=%s, identityPool=%s", cognitoConfig.Region, cognitoConfig.IdentityPool.ID)
-
-	// Step 3: Create manifest
+	// Step 2: Create manifest
 	log.Printf("Creating upload manifest for dataset %s...", cfg.DatasetID)
 	manifestNodeID, err := client.CreateManifest(cfg.DatasetID)
 	if err != nil {
@@ -187,7 +161,7 @@ func run() error {
 	}
 	log.Printf("Created manifest: %s", manifestNodeID)
 
-	// Step 4: Build file list with UUIDs and sync to manifest
+	// Step 3: Build file list with UUIDs and sync to manifest
 	filesToUpload := make([]FileToUpload, len(files))
 	manifestFiles := make([]ManifestFileDTO, len(files))
 	for i, f := range files {
@@ -219,21 +193,25 @@ func run() error {
 	}
 	log.Printf("Manifest synced successfully")
 
-	// Step 5: Get AWS credentials via Cognito
-	log.Printf("Refreshing Cognito credentials...")
-	awsCreds, err := RefreshAndGetAWSCredentials(ctx, cognitoConfig, cfg.RefreshToken)
+	// Step 4: Get scoped AWS credentials for S3 upload via upload-credentials endpoint
+	log.Printf("Getting upload credentials...")
+	awsCreds, bucket, region, err := GetUploadCredentials(cfg.APIHost2, cfg.DatasetID, manifestNodeID, cfg.ExecutionRunID, cfg.CallbackToken)
 	if err != nil {
-		return fmt.Errorf("failed to get AWS credentials: %w", err)
+		return fmt.Errorf("failed to get upload credentials: %w", err)
 	}
-	log.Printf("Obtained temporary AWS credentials (expires: %s)", awsCreds.Expires.Format("15:04:05"))
+	// Use bucket from credentials response, fall back to env var
+	if bucket == "" {
+		bucket = cfg.UploadBucket
+	}
+	log.Printf("Obtained temporary upload credentials (expires: %s)", awsCreds.Expires.Format("15:04:05"))
 
-	// Step 6: Upload all files to S3
-	log.Printf("Starting S3 upload to bucket %s...", cfg.UploadBucket)
-	if err := UploadFiles(ctx, awsCreds, cfg.UploadBucket, manifestNodeID, filesToUpload, cfg.OrganizationID, cfg.DatasetID); err != nil {
+	// Step 5: Upload all files to S3
+	log.Printf("Starting S3 upload to bucket %s...", bucket)
+	if err := UploadFiles(context.Background(), awsCreds, bucket, manifestNodeID, filesToUpload, cfg.OrganizationID, cfg.DatasetID, region); err != nil {
 		return fmt.Errorf("S3 upload failed: %w", err)
 	}
 
-	// Step 7: Summary
+	// Step 6: Summary
 	log.Printf("Upload complete: %d files uploaded to manifest %s", len(files), manifestNodeID)
 	return nil
 }
@@ -246,9 +224,8 @@ func lambdaHandler(ctx context.Context, event LambdaEvent) (LambdaResponse, erro
 	// Bridge per-invocation payload fields to env vars so the core logic
 	// works identically to ECS mode.
 	os.Setenv("INPUT_DIR", event.InputDir)
-	os.Setenv("SESSION_TOKEN", event.SessionToken)
-	os.Setenv("REFRESH_TOKEN", event.RefreshToken)
 	os.Setenv("EXECUTION_RUN_ID", event.ExecutionRunID)
+	os.Setenv("CALLBACK_TOKEN", event.CallbackToken)
 	os.Setenv("DATASET_ID", event.DatasetID)
 	os.Setenv("ORGANIZATION_ID", event.OrganizationID)
 	os.Setenv("TARGET_TYPE", event.TargetType)
