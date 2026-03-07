@@ -24,7 +24,7 @@ type UploadCredentialsResponse struct {
 // GetUploadCredentials calls the upload service to get temporary S3 credentials
 // scoped to the given manifest prefix.
 func GetUploadCredentials(apiHost2, datasetID, manifestNodeID, executionRunID, callbackToken string) (aws.Credentials, string, string, error) {
-	reqURL := fmt.Sprintf("%s/manifest/upload-credentials?dataset_id=%s", apiHost2, url.QueryEscape(datasetID))
+	reqURL := fmt.Sprintf("%s/upload/manifest/upload-credentials?dataset_id=%s", apiHost2, url.QueryEscape(datasetID))
 
 	body := fmt.Sprintf(`{"manifestNodeId":%q}`, manifestNodeID)
 	req, err := http.NewRequest("POST", reqURL, strings.NewReader(body))
