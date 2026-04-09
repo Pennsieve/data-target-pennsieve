@@ -83,7 +83,7 @@ func (c *PennsieveClient) SyncManifest(manifestNodeID, datasetID string, files [
 }
 
 func (c *PennsieveClient) postManifest(datasetID string, body interface{}, result interface{}) error {
-	reqURL := fmt.Sprintf("%s/manifest?dataset_id=%s", c.apiHost2, url.QueryEscape(datasetID))
+	reqURL := fmt.Sprintf("%s/upload/manifest?dataset_id=%s", c.apiHost2, url.QueryEscape(datasetID))
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshaling manifest request: %w", err)
