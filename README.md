@@ -36,22 +36,27 @@ make docker-push
 | Variable | Description |
 |---|---|
 | `INPUT_DIR` | Directory containing files to upload |
-| `SESSION_TOKEN` | Pennsieve API auth token |
+| `CALLBACK_TOKEN` | Workflow callback token (used for `Callback workflow-service:{runId}:{token}` auth) |
 | `DATASET_ID` | Target dataset ID |
-| `REFRESH_TOKEN` | Cognito refresh token (can be empty for Lambda) |
+| `EXECUTION_RUN_ID` | Unique execution identifier |
 
 ### Optional Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `UPLOAD_BUCKET` | S3 upload bucket | `pennsieve-prod-uploads-v2-use1` |
 | `TARGET_FOLDER` | Destination folder in dataset | |
+| `OVERWRITE_FILES` | If `true`, replace an existing package with the same name in the target folder; otherwise keep both | `false` |
 | `TARGET_TYPE` | Upload target type | |
 | `ORGANIZATION_ID` | Organization ID for S3 tagging | |
-| `PENNSIEVE_API_HOST` | Pennsieve API host | |
 | `PENNSIEVE_API_HOST2` | API host for manifest operations | |
 | `DEPLOYMENT_MODE` | Environment indicator | |
-| `EXECUTION_RUN_ID` | Unique execution identifier | |
+
+> **No upload bucket needed.** Files are uploaded **directly to the destination
+> storage bucket**: the processor calls `POST /upload/manifest/storage-credentials`
+> to get short-lived STS credentials plus the bucket and key prefix
+> (`O{org}/D{ds}/{manifest}`), uploads to `{keyPrefix}/{uploadId}`, then calls
+> `POST /upload/manifest/files/finalize` so the server verifies the objects and
+> creates the package rows. There is no user-supplied `UPLOAD_BUCKET`.
 
 ## Running
 
