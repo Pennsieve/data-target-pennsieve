@@ -6,10 +6,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 )
+
+// parseBool leniently parses a boolean env/param value; unset or invalid → false.
+func parseBool(s string) bool {
+	v, _ := strconv.ParseBool(strings.TrimSpace(s))
+	return v
+}
 
 // Config holds the environment configuration passed by the orchestrator.
 type Config struct {
@@ -25,6 +33,7 @@ type Config struct {
 	OrganizationID string
 	TargetFolder   string
 	TargetType     string
+	Overwrite      bool // replace an existing package with the same name (vs. keep both)
 }
 
 // LambdaEvent mirrors the per-invocation payload fields sent by the
@@ -61,6 +70,7 @@ func loadConfig() (*Config, error) {
 		OrganizationID: os.Getenv("ORGANIZATION_ID"),
 		TargetFolder:   os.Getenv("TARGET_FOLDER"),
 		TargetType:     os.Getenv("TARGET_TYPE"),
+		Overwrite:      parseBool(os.Getenv("OVERWRITE_FILES")),
 	}
 
 	if cfg.InputDir == "" {
@@ -217,8 +227,8 @@ func run() error {
 
 	// Step 6: Finalize — the server verifies each object in storage, creates the
 	// Postgres package/file rows, and marks the manifest files Finalized.
-	log.Printf("Finalizing %d files...", len(finalizeFiles))
-	if err := client.FinalizeFiles(manifestNodeID, cfg.DatasetID, finalizeFiles); err != nil {
+	log.Printf("Finalizing %d files (overwrite=%t)...", len(finalizeFiles), cfg.Overwrite)
+	if err := client.FinalizeFiles(manifestNodeID, cfg.DatasetID, finalizeFiles, cfg.Overwrite); err != nil {
 		return fmt.Errorf("finalize failed: %w", err)
 	}
 

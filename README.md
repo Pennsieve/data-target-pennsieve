@@ -45,6 +45,7 @@ make docker-push
 | Variable | Description | Default |
 |---|---|---|
 | `TARGET_FOLDER` | Destination folder in dataset | |
+| `OVERWRITE_FILES` | If `true`, replace an existing package with the same name in the target folder; otherwise keep both | `false` |
 | `TARGET_TYPE` | Upload target type | |
 | `ORGANIZATION_ID` | Organization ID for S3 tagging | |
 | `PENNSIEVE_API_HOST2` | API host for manifest operations | |

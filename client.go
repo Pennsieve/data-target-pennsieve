@@ -113,7 +113,12 @@ type FinalizeFile struct {
 type finalizeRequest struct {
 	ManifestNodeID string         `json:"manifestNodeId"`
 	Files          []FinalizeFile `json:"files"`
+	OnConflict     string         `json:"onConflict,omitempty"`
 }
+
+// onConflictReplace overwrites an existing package with the same name in the
+// target folder. Omitting onConflict keeps both (the server appends " (N)").
+const onConflictReplace = "replace"
 
 type finalizeResult struct {
 	UploadID string `json:"uploadId"`
@@ -129,7 +134,15 @@ type finalizeResponse struct {
 // verifies each object in the storage bucket, creates the Postgres
 // package/file rows, and marks each manifest file Finalized. Batched at 250
 // files per call (server max). Idempotent per uploadId.
-func (c *PennsieveClient) FinalizeFiles(manifestNodeID, datasetID string, files []FinalizeFile) error {
+//
+// When overwrite is true, name collisions with an existing package in the
+// target folder REPLACE it; otherwise both are kept (server appends " (N)").
+func (c *PennsieveClient) FinalizeFiles(manifestNodeID, datasetID string, files []FinalizeFile, overwrite bool) error {
+	onConflict := ""
+	if overwrite {
+		onConflict = onConflictReplace
+	}
+
 	for start := 0; start < len(files); start += finalizeBatchSize {
 		end := start + finalizeBatchSize
 		if end > len(files) {
@@ -138,7 +151,7 @@ func (c *PennsieveClient) FinalizeFiles(manifestNodeID, datasetID string, files 
 		batch := files[start:end]
 
 		reqURL := fmt.Sprintf("%s/upload/manifest/files/finalize?dataset_id=%s", c.apiHost2, url.QueryEscape(datasetID))
-		jsonBody, err := json.Marshal(finalizeRequest{ManifestNodeID: manifestNodeID, Files: batch})
+		jsonBody, err := json.Marshal(finalizeRequest{ManifestNodeID: manifestNodeID, Files: batch, OnConflict: onConflict})
 		if err != nil {
 			return fmt.Errorf("marshaling finalize request: %w", err)
 		}
