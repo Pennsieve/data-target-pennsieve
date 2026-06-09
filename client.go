@@ -99,6 +99,75 @@ func (c *PennsieveClient) postManifest(datasetID string, body interface{}, resul
 	return c.doJSON(req, result)
 }
 
+// finalizeBatchSize is the server's max files per /manifest/files/finalize call.
+const finalizeBatchSize = 250
+
+// FinalizeFile is one file in a POST /manifest/files/finalize batch. SHA256 is
+// the base64 ChecksumSHA256 returned by the S3 upload.
+type FinalizeFile struct {
+	UploadID string `json:"uploadId"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256,omitempty"`
+}
+
+type finalizeRequest struct {
+	ManifestNodeID string         `json:"manifestNodeId"`
+	Files          []FinalizeFile `json:"files"`
+}
+
+type finalizeResult struct {
+	UploadID string `json:"uploadId"`
+	Status   string `json:"status"` // "finalized" | "failed"
+	Error    string `json:"error,omitempty"`
+}
+
+type finalizeResponse struct {
+	Results []finalizeResult `json:"results"`
+}
+
+// FinalizeFiles completes the two-phase, direct-to-storage upload: the server
+// verifies each object in the storage bucket, creates the Postgres
+// package/file rows, and marks each manifest file Finalized. Batched at 250
+// files per call (server max). Idempotent per uploadId.
+func (c *PennsieveClient) FinalizeFiles(manifestNodeID, datasetID string, files []FinalizeFile) error {
+	for start := 0; start < len(files); start += finalizeBatchSize {
+		end := start + finalizeBatchSize
+		if end > len(files) {
+			end = len(files)
+		}
+		batch := files[start:end]
+
+		reqURL := fmt.Sprintf("%s/upload/manifest/files/finalize?dataset_id=%s", c.apiHost2, url.QueryEscape(datasetID))
+		jsonBody, err := json.Marshal(finalizeRequest{ManifestNodeID: manifestNodeID, Files: batch})
+		if err != nil {
+			return fmt.Errorf("marshaling finalize request: %w", err)
+		}
+
+		req, err := http.NewRequest("POST", reqURL, bytes.NewReader(jsonBody))
+		if err != nil {
+			return fmt.Errorf("creating finalize request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", fmt.Sprintf("Callback workflow-service:%s:%s", c.executionRunID, c.callbackToken))
+
+		var result finalizeResponse
+		if err := c.doJSON(req, &result); err != nil {
+			return fmt.Errorf("finalizing files: %w", err)
+		}
+
+		var failures []string
+		for _, r := range result.Results {
+			if r.Status != "finalized" {
+				failures = append(failures, fmt.Sprintf("%s: %s", r.UploadID, r.Error))
+			}
+		}
+		if len(failures) > 0 {
+			return fmt.Errorf("finalize reported %d failed files: %v", len(failures), failures)
+		}
+	}
+	return nil
+}
+
 func (c *PennsieveClient) doJSON(req *http.Request, result interface{}) error {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
