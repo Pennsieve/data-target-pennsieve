@@ -6,10 +6,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
 )
+
+// parseBool leniently parses a boolean env/param value; unset or invalid → false.
+func parseBool(s string) bool {
+	v, _ := strconv.ParseBool(strings.TrimSpace(s))
+	return v
+}
 
 // Config holds the environment configuration passed by the orchestrator.
 type Config struct {
@@ -25,7 +33,7 @@ type Config struct {
 	OrganizationID string
 	TargetFolder   string
 	TargetType     string
-	UploadBucket   string
+	Overwrite      bool // replace an existing package with the same name (vs. keep both)
 }
 
 // LambdaEvent mirrors the per-invocation payload fields sent by the
@@ -62,7 +70,7 @@ func loadConfig() (*Config, error) {
 		OrganizationID: os.Getenv("ORGANIZATION_ID"),
 		TargetFolder:   os.Getenv("TARGET_FOLDER"),
 		TargetType:     os.Getenv("TARGET_TYPE"),
-		UploadBucket:   os.Getenv("UPLOAD_BUCKET"),
+		Overwrite:      parseBool(os.Getenv("OVERWRITE_FILES")),
 	}
 
 	if cfg.InputDir == "" {
@@ -161,7 +169,18 @@ func run() error {
 	}
 	log.Printf("Created manifest: %s", manifestNodeID)
 
-	// Step 3: Build file list with UUIDs and sync to manifest
+	// Step 3: Get direct-to-storage credentials. The platform resolves the
+	// destination bucket + key prefix (O{org}/D{ds}/{manifest}) — no
+	// user-supplied upload bucket. Fetch before sync so the manifest records
+	// the real object keys.
+	log.Printf("Getting storage credentials...")
+	awsCreds, bucket, keyPrefix, region, err := GetStorageCredentials(cfg.APIHost2, cfg.DatasetID, manifestNodeID, cfg.ExecutionRunID, cfg.CallbackToken)
+	if err != nil {
+		return fmt.Errorf("failed to get storage credentials: %w", err)
+	}
+	log.Printf("Obtained storage credentials: bucket=%s prefix=%s (expires %s)", bucket, keyPrefix, awsCreds.Expires.Format("15:04:05"))
+
+	// Step 4: Build file list with UUIDs + sizes and sync to manifest.
 	filesToUpload := make([]FileToUpload, len(files))
 	manifestFiles := make([]ManifestFileDTO, len(files))
 	for i, f := range files {
@@ -175,13 +194,19 @@ func run() error {
 			targetPath = filepath.Join(targetPath, dir)
 		}
 
+		var size int64
+		if info, statErr := os.Stat(f); statErr == nil {
+			size = info.Size()
+		}
+
 		filesToUpload[i] = FileToUpload{
 			Path:     f,
 			UploadID: uploadID,
+			Size:     size,
 		}
 		manifestFiles[i] = ManifestFileDTO{
 			UploadID:   uploadID,
-			S3Key:      fmt.Sprintf("%s/%s", manifestNodeID, uploadID),
+			S3Key:      fmt.Sprintf("%s/%s", keyPrefix, uploadID),
 			TargetPath: targetPath,
 			TargetName: filepath.Base(f),
 		}
@@ -193,26 +218,21 @@ func run() error {
 	}
 	log.Printf("Manifest synced successfully")
 
-	// Step 4: Get scoped AWS credentials for S3 upload via upload-credentials endpoint
-	log.Printf("Getting upload credentials...")
-	awsCreds, bucket, region, err := GetUploadCredentials(cfg.APIHost2, cfg.DatasetID, manifestNodeID, cfg.ExecutionRunID, cfg.CallbackToken)
+	// Step 5: Upload all files directly to the storage bucket.
+	log.Printf("Starting direct-to-storage upload to s3://%s/%s ...", bucket, keyPrefix)
+	finalizeFiles, err := UploadFiles(context.Background(), awsCreds, bucket, keyPrefix, filesToUpload, cfg.OrganizationID, cfg.DatasetID, region)
 	if err != nil {
-		return fmt.Errorf("failed to get upload credentials: %w", err)
-	}
-	// Use bucket from credentials response, fall back to env var
-	if bucket == "" {
-		bucket = cfg.UploadBucket
-	}
-	log.Printf("Obtained temporary upload credentials (expires: %s)", awsCreds.Expires.Format("15:04:05"))
-
-	// Step 5: Upload all files to S3
-	log.Printf("Starting S3 upload to bucket %s...", bucket)
-	if err := UploadFiles(context.Background(), awsCreds, bucket, manifestNodeID, filesToUpload, cfg.OrganizationID, cfg.DatasetID, region); err != nil {
 		return fmt.Errorf("S3 upload failed: %w", err)
 	}
 
-	// Step 6: Summary
-	log.Printf("Upload complete: %d files uploaded to manifest %s", len(files), manifestNodeID)
+	// Step 6: Finalize — the server verifies each object in storage, creates the
+	// Postgres package/file rows, and marks the manifest files Finalized.
+	log.Printf("Finalizing %d files (overwrite=%t)...", len(finalizeFiles), cfg.Overwrite)
+	if err := client.FinalizeFiles(manifestNodeID, cfg.DatasetID, finalizeFiles, cfg.Overwrite); err != nil {
+		return fmt.Errorf("finalize failed: %w", err)
+	}
+
+	log.Printf("Upload complete: %d files uploaded + finalized for manifest %s", len(files), manifestNodeID)
 	return nil
 }
 
