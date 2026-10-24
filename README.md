@@ -46,6 +46,7 @@ make docker-push
 |---|---|---|
 | `TARGET_FOLDER` | Destination folder in dataset | |
 | `OVERWRITE_FILES` | If `true`, replace an existing package with the same name in the target folder; otherwise keep both | `false` |
+| `PATH_PREFIX` | Upload only the files below this path in `INPUT_DIR`, and drop it from their destination: with `qc`, `qc/plots/a.png` lands at `TARGET_FOLDER/plots/a.png` and `data/b.csv` is not uploaded. Slash-separated, relative; `..` is refused. A prefix that matches none of the input's files fails the target | everything |
 | `TARGET_TYPE` | Upload target type | |
 | `ORGANIZATION_ID` | Organization ID for S3 tagging | |
 | `PENNSIEVE_API_HOST2` | API host for manifest operations | |
@@ -74,13 +75,17 @@ The service detects the `AWS_LAMBDA_RUNTIME_API` environment variable and automa
 
 ```json
 {
-  "inputDir": "/mnt/efs/input",
+  "inputDir": "/mnt/efs/.../workdir/abc123",
   "executionRunId": "run-123",
-  "sessionToken": "...",
+  "callbackToken": "...",
   "datasetId": "N:dataset:...",
-  "refreshToken": "..."
+  "organizationId": "N:organization:...",
+  "targetType": "Pennsieve Dataset",
+  "params": { "TARGET_FOLDER": "results", "PATH_PREFIX": "qc" }
 }
 ```
+
+Only the target's own params (`TARGET_FOLDER`, `OVERWRITE_FILES`, `PATH_PREFIX`) are read from `params`; other keys are ignored, so a param can't override `DATASET_ID`, `CALLBACK_TOKEN`, the API host or the AWS settings, and a param of the previous invocation on a reused execution environment doesn't linger.
 
 And returns:
 
