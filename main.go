@@ -105,7 +105,7 @@ func normalizePathPrefix(prefix string) (string, error) {
 	if prefix == "" {
 		return "", nil
 	}
-	if strings.ContainsAny(prefix, "\\") {
+	if strings.Contains(prefix, "\\") {
 		return "", fmt.Errorf("%q: must be a slash-separated path", prefix)
 	}
 	for _, part := range strings.Split(prefix, "/") {
@@ -124,7 +124,7 @@ func matchPathPrefix(prefix, rel string) (string, bool) {
 		return rel, true
 	}
 	if rel == prefix {
-		return filepath.Base(rel), true
+		return path.Base(rel), true
 	}
 	if stripped, ok := strings.CutPrefix(rel, prefix+"/"); ok {
 		return stripped, true
@@ -144,10 +144,7 @@ type selectedFile struct {
 func selectFiles(inputDir, prefix string, files []string) []selectedFile {
 	var selected []selectedFile
 	for _, f := range files {
-		rel, err := filepath.Rel(inputDir, f)
-		if err != nil {
-			continue
-		}
+		rel, _ := filepath.Rel(inputDir, f) // f is below inputDir: discoverFiles joined it
 		stripped, ok := matchPathPrefix(prefix, filepath.ToSlash(rel))
 		if !ok {
 			continue
@@ -201,6 +198,7 @@ func run() error {
 	log.Printf("  datasetId:      %s", cfg.DatasetID)
 	log.Printf("  organizationId: %s", cfg.OrganizationID)
 	log.Printf("  targetFolder:   %s", cfg.TargetFolder)
+	log.Printf("  pathPrefix:     %s", cfg.PathPrefix)
 	log.Printf("  deploymentMode: %s", cfg.DeploymentMode)
 	log.Printf("  apiHost2:       %s", cfg.APIHost2)
 
@@ -214,25 +212,21 @@ func run() error {
 		log.Printf("No files found in %s, nothing to upload", cfg.InputDir)
 		return nil
 	}
+	// An empty input is nothing to do; a prefix that matches none of the
+	// files is almost always a misconfigured run, so it fails loudly.
 	selected := selectFiles(cfg.InputDir, cfg.PathPrefix, files)
-	if cfg.PathPrefix != "" {
-		log.Printf("  pathPrefix:     %s (%d of %d files)", cfg.PathPrefix, len(selected), len(files))
-	}
 	if len(selected) == 0 {
-		log.Printf("No files below %s in %s, nothing to upload", cfg.PathPrefix, cfg.InputDir)
-		return nil
+		return fmt.Errorf("PATH_PREFIX %q matches none of the %d files in %s", cfg.PathPrefix, len(files), cfg.InputDir)
 	}
-	files = nil
 
-	log.Printf("Discovered %d files to upload:", len(files))
-	for _, f := range files {
-		info, _ := os.Stat(f)
+	log.Printf("Discovered %d files to upload (%d of %d below the prefix):", len(selected), len(selected), len(files))
+	for _, f := range selected {
+		info, _ := os.Stat(f.path)
 		size := int64(0)
 		if info != nil {
 			size = info.Size()
 		}
-		rel, _ := filepath.Rel(cfg.InputDir, f)
-		log.Printf("  %s (%d bytes)", rel, size)
+		log.Printf("  %s (%d bytes)", f.rel, size)
 	}
 
 	// Step 1: Create Pennsieve client (uses callback auth)
@@ -312,17 +306,38 @@ func run() error {
 	return nil
 }
 
+// targetParams are the target-type-specific params this target reads. In
+// Lambda mode only these are bridged from the event's params to the
+// environment: anything else (PENNSIEVE_API_HOST2, HTTPS_PROXY, AWS_*) is a
+// setting of the function, which a run may not redirect.
+var targetParams = []string{"TARGET_FOLDER", "OVERWRITE_FILES", "PATH_PREFIX"}
+
+// bridgeParams sets the environment for the target params from the event's
+// params, and clears the ones the event doesn't set: a Lambda execution
+// environment is reused, so a param of the previous run must not linger.
+func bridgeParams(params map[string]string) {
+	known := make(map[string]bool, len(targetParams))
+	for _, k := range targetParams {
+		known[k] = true
+		if v, ok := params[k]; ok {
+			os.Setenv(k, v)
+		} else {
+			os.Unsetenv(k)
+		}
+	}
+	for k := range params {
+		if !known[k] {
+			log.Printf("Ignoring unknown param %s", k)
+		}
+	}
+}
+
 // lambdaHandler bridges the Lambda invocation payload to environment variables,
 // then runs the same logic as ECS mode.
 func lambdaHandler(ctx context.Context, event LambdaEvent) (LambdaResponse, error) {
 	log.Printf("Lambda handler invoked")
 
-	// Bridge target-type-specific params to env vars first, so the
-	// per-invocation fields below always win: a param can't redirect the
-	// upload or replace the token.
-	for k, v := range event.Params {
-		os.Setenv(k, v)
-	}
+	bridgeParams(event.Params)
 
 	// Bridge per-invocation payload fields to env vars so the core logic
 	// works identically to ECS mode.

@@ -81,4 +81,26 @@ func TestSelectFiles(t *testing.T) {
 	if got := selectFiles(dir, "nothing", paths); len(got) != 0 {
 		t.Errorf("prefix nothing: got %v, want none", rels(got))
 	}
+	// A prefix naming one file selects it, under its own name.
+	if got, want := rels(selectFiles(dir, "qc/sub/c.png", paths)), []string{"c.png"}; !equal(got, want) {
+		t.Errorf("prefix qc/sub/c.png: got %v, want %v", got, want)
+	}
+}
+
+func TestBridgeParams(t *testing.T) {
+	t.Setenv("PATH_PREFIX", "stale")     // from a previous invocation
+	t.Setenv("PENNSIEVE_API_HOST2", "api") // a function setting
+	bridgeParams(map[string]string{"TARGET_FOLDER": "out", "PENNSIEVE_API_HOST2": "https://attacker.example", "DATASET_ID": "N:dataset:other"})
+	if got := os.Getenv("TARGET_FOLDER"); got != "out" {
+		t.Errorf("TARGET_FOLDER = %q, want out", got)
+	}
+	if _, set := os.LookupEnv("PATH_PREFIX"); set {
+		t.Error("PATH_PREFIX from the previous invocation is still set")
+	}
+	if got := os.Getenv("PENNSIEVE_API_HOST2"); got != "api" {
+		t.Errorf("PENNSIEVE_API_HOST2 = %q, a param overrode a function setting", got)
+	}
+	if _, set := os.LookupEnv("DATASET_ID"); set {
+		t.Error("DATASET_ID was set from a param")
+	}
 }
