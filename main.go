@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,7 +34,8 @@ type Config struct {
 	OrganizationID string
 	TargetFolder   string
 	TargetType     string
-	Overwrite      bool // replace an existing package with the same name (vs. keep both)
+	Overwrite      bool   // replace an existing package with the same name (vs. keep both)
+	PathPrefix     string // upload only the files below this path in INPUT_DIR, without it
 }
 
 // LambdaEvent mirrors the per-invocation payload fields sent by the
@@ -73,6 +75,12 @@ func loadConfig() (*Config, error) {
 		Overwrite:      parseBool(os.Getenv("OVERWRITE_FILES")),
 	}
 
+	prefix, err := normalizePathPrefix(os.Getenv("PATH_PREFIX"))
+	if err != nil {
+		return nil, fmt.Errorf("PATH_PREFIX: %w", err)
+	}
+	cfg.PathPrefix = prefix
+
 	if cfg.InputDir == "" {
 		return nil, fmt.Errorf("INPUT_DIR is required")
 	}
@@ -87,6 +95,66 @@ func loadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizePathPrefix is PATH_PREFIX as a slash-separated path relative to
+// INPUT_DIR: leading and trailing slashes dropped, empty for everything. A
+// prefix that could leave INPUT_DIR is refused.
+func normalizePathPrefix(prefix string) (string, error) {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if prefix == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(prefix, "\\") {
+		return "", fmt.Errorf("%q: must be a slash-separated path", prefix)
+	}
+	for _, part := range strings.Split(prefix, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("%q: must be a relative path without . or .. parts", prefix)
+		}
+	}
+	return prefix, nil
+}
+
+// matchPathPrefix reports whether rel, a slash-separated path relative to
+// INPUT_DIR, is below prefix, and returns it with the prefix removed. An
+// empty prefix matches everything.
+func matchPathPrefix(prefix, rel string) (string, bool) {
+	if prefix == "" {
+		return rel, true
+	}
+	if rel == prefix {
+		return filepath.Base(rel), true
+	}
+	if stripped, ok := strings.CutPrefix(rel, prefix+"/"); ok {
+		return stripped, true
+	}
+	return "", false
+}
+
+// selectedFile is a file to upload: its path on disk and its destination
+// path below TARGET_FOLDER.
+type selectedFile struct {
+	path string
+	rel  string
+}
+
+// selectFiles keeps the files below prefix in inputDir, each with its
+// destination path (the prefix removed).
+func selectFiles(inputDir, prefix string, files []string) []selectedFile {
+	var selected []selectedFile
+	for _, f := range files {
+		rel, err := filepath.Rel(inputDir, f)
+		if err != nil {
+			continue
+		}
+		stripped, ok := matchPathPrefix(prefix, filepath.ToSlash(rel))
+		if !ok {
+			continue
+		}
+		selected = append(selected, selectedFile{path: f, rel: stripped})
+	}
+	return selected
 }
 
 // discoverFiles walks INPUT_DIR and returns all regular file paths.
@@ -146,6 +214,15 @@ func run() error {
 		log.Printf("No files found in %s, nothing to upload", cfg.InputDir)
 		return nil
 	}
+	selected := selectFiles(cfg.InputDir, cfg.PathPrefix, files)
+	if cfg.PathPrefix != "" {
+		log.Printf("  pathPrefix:     %s (%d of %d files)", cfg.PathPrefix, len(selected), len(files))
+	}
+	if len(selected) == 0 {
+		log.Printf("No files below %s in %s, nothing to upload", cfg.PathPrefix, cfg.InputDir)
+		return nil
+	}
+	files = nil
 
 	log.Printf("Discovered %d files to upload:", len(files))
 	for _, f := range files {
@@ -181,26 +258,25 @@ func run() error {
 	log.Printf("Obtained storage credentials: bucket=%s prefix=%s (expires %s)", bucket, keyPrefix, awsCreds.Expires.Format("15:04:05"))
 
 	// Step 4: Build file list with UUIDs + sizes and sync to manifest.
-	filesToUpload := make([]FileToUpload, len(files))
-	manifestFiles := make([]ManifestFileDTO, len(files))
-	for i, f := range files {
+	filesToUpload := make([]FileToUpload, len(selected))
+	manifestFiles := make([]ManifestFileDTO, len(selected))
+	for i, f := range selected {
 		uploadID := uuid.New().String()
-		rel, _ := filepath.Rel(cfg.InputDir, f)
 
-		// targetPath = target folder + relative directory
+		// targetPath = target folder + the file's directory below the prefix
 		targetPath := cfg.TargetFolder
-		dir := filepath.Dir(rel)
+		dir := path.Dir(f.rel)
 		if dir != "." && dir != "" {
-			targetPath = filepath.Join(targetPath, dir)
+			targetPath = filepath.Join(targetPath, filepath.FromSlash(dir))
 		}
 
 		var size int64
-		if info, statErr := os.Stat(f); statErr == nil {
+		if info, statErr := os.Stat(f.path); statErr == nil {
 			size = info.Size()
 		}
 
 		filesToUpload[i] = FileToUpload{
-			Path:     f,
+			Path:     f.path,
 			UploadID: uploadID,
 			Size:     size,
 		}
@@ -208,7 +284,7 @@ func run() error {
 			UploadID:   uploadID,
 			S3Key:      fmt.Sprintf("%s/%s", keyPrefix, uploadID),
 			TargetPath: targetPath,
-			TargetName: filepath.Base(f),
+			TargetName: path.Base(f.rel),
 		}
 	}
 
@@ -232,7 +308,7 @@ func run() error {
 		return fmt.Errorf("finalize failed: %w", err)
 	}
 
-	log.Printf("Upload complete: %d files uploaded + finalized for manifest %s", len(files), manifestNodeID)
+	log.Printf("Upload complete: %d files uploaded + finalized for manifest %s", len(selected), manifestNodeID)
 	return nil
 }
 
@@ -240,6 +316,13 @@ func run() error {
 // then runs the same logic as ECS mode.
 func lambdaHandler(ctx context.Context, event LambdaEvent) (LambdaResponse, error) {
 	log.Printf("Lambda handler invoked")
+
+	// Bridge target-type-specific params to env vars first, so the
+	// per-invocation fields below always win: a param can't redirect the
+	// upload or replace the token.
+	for k, v := range event.Params {
+		os.Setenv(k, v)
+	}
 
 	// Bridge per-invocation payload fields to env vars so the core logic
 	// works identically to ECS mode.
@@ -249,11 +332,6 @@ func lambdaHandler(ctx context.Context, event LambdaEvent) (LambdaResponse, erro
 	os.Setenv("DATASET_ID", event.DatasetID)
 	os.Setenv("ORGANIZATION_ID", event.OrganizationID)
 	os.Setenv("TARGET_TYPE", event.TargetType)
-
-	// Bridge target-type-specific params to env vars
-	for k, v := range event.Params {
-		os.Setenv(k, v)
-	}
 
 	if err := run(); err != nil {
 		return LambdaResponse{Status: "error", ExecutionRunID: event.ExecutionRunID}, err
