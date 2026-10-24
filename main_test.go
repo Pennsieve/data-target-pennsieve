@@ -88,7 +88,7 @@ func TestSelectFiles(t *testing.T) {
 }
 
 func TestBridgeParams(t *testing.T) {
-	t.Setenv("PATH_PREFIX", "stale")     // from a previous invocation
+	t.Setenv("PATH_PREFIX", "stale")       // from a previous invocation
 	t.Setenv("PENNSIEVE_API_HOST2", "api") // a function setting
 	bridgeParams(map[string]string{"TARGET_FOLDER": "out", "PENNSIEVE_API_HOST2": "https://attacker.example", "DATASET_ID": "N:dataset:other"})
 	if got := os.Getenv("TARGET_FOLDER"); got != "out" {
